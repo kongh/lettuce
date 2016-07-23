@@ -17,6 +17,7 @@ import com.lambdaworks.redis.internal.LettuceSets;
 import com.lambdaworks.redis.resource.ClientResources;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
 import io.netty.channel.*;
 import io.netty.channel.local.LocalAddress;
 import io.netty.util.concurrent.Future;
@@ -38,6 +39,7 @@ public class CommandHandler<K, V> extends ChannelDuplexHandler implements RedisC
 
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(CommandHandler.class);
     private static final WriteLogListener WRITE_LOG_LISTENER = new WriteLogListener();
+    private static final AtomicLong CHANNEL_COUNTER = new AtomicLong();
 
     /**
      * When we encounter an unexpected IOException we look for these {@link Throwable#getMessage() messages} (because we have no
@@ -47,6 +49,7 @@ public class CommandHandler<K, V> extends ChannelDuplexHandler implements RedisC
     private static final Set<String> SUPPRESS_IO_EXCEPTION_MESSAGES = LettuceSets.unmodifiableSet("Connection reset by peer",
             "Broken pipe", "Connection timed out");
 
+    protected final long commandHandlerId = CHANNEL_COUNTER.incrementAndGet();
     protected final ClientOptions clientOptions;
     protected final ClientResources clientResources;
     protected final Queue<RedisCommand<K, V, ?>> queue;
@@ -56,7 +59,7 @@ public class CommandHandler<K, V> extends ChannelDuplexHandler implements RedisC
     // all access to the commandBuffer is synchronized
     protected final Deque<RedisCommand<K, V, ?>> commandBuffer = LettuceFactories.newConcurrentQueue();
     protected final Deque<RedisCommand<K, V, ?>> transportBuffer = LettuceFactories.newConcurrentQueue();
-    protected ByteBuf buffer;
+    protected final ByteBuf buffer = ByteBufAllocator.DEFAULT.directBuffer(8192 * 8);
     protected RedisStateMachine<K, V> rsm;
     protected Channel channel;
     private volatile ConnectionWatchdog connectionWatchdog;
@@ -102,19 +105,37 @@ public class CommandHandler<K, V> extends ChannelDuplexHandler implements RedisC
     @Override
     public void channelRegistered(ChannelHandlerContext ctx) throws Exception {
 
-        setState(LifecycleState.REGISTERED);
-        buffer = ctx.alloc().directBuffer(8192 * 8);
-        rsm = new RedisStateMachine<K, V>();
-
+        buffer.retain();
         synchronized (stateLock) {
             channel = ctx.channel();
         }
+
+        if (debugEnabled) {
+            logPrefix = null;
+            logger.debug("{} channelRegistered()", logPrefix());
+        }
+
+        setState(LifecycleState.REGISTERED);
+
+        buffer.clear();
+        rsm = new RedisStateMachine<K, V>();
+        ctx.fireChannelRegistered();
     }
 
     @Override
     public void channelUnregistered(ChannelHandlerContext ctx) throws Exception {
 
-        releaseBuffer();
+        buffer.release();
+        if (debugEnabled) {
+            logger.debug("{} channelUnregistered()", logPrefix());
+        }
+
+        if (channel != null && ctx.channel() != channel) {
+            logger.debug("{} My channel and ctx.channel mismatch. Propagating event to other listeners", logPrefix());
+            ctx.fireChannelUnregistered();
+            return;
+        }
+
         releaseStateMachine();
 
         if (lifecycleState == LifecycleState.CLOSED) {
@@ -123,6 +144,8 @@ public class CommandHandler<K, V> extends ChannelDuplexHandler implements RedisC
         synchronized (stateLock) {
             channel = null;
         }
+
+        ctx.fireChannelUnregistered();
     }
 
     /**
@@ -132,23 +155,25 @@ public class CommandHandler<K, V> extends ChannelDuplexHandler implements RedisC
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
 
         ByteBuf input = (ByteBuf) msg;
+        logger.debug("{} Received: {} bytes, {} queued commands", logPrefix(), input.readableBytes(), queue.size());
 
-        if (!input.isReadable() || input.refCnt() == 0 || buffer == null) {
+        if (!input.isReadable() || input.refCnt() == 0) {
+            logger.warn("{} Input not readable {}, {}", logPrefix(), input.isReadable(), input.refCnt());
+            return;
+        }
+
+        if(buffer.refCnt() < 1){
+            logger.warn("{} Ignoring received data for closed or abandoned connection", logPrefix);
             return;
         }
 
         try {
-            buffer.writeBytes(input);
 
-            if (debugEnabled) {
-                if (traceEnabled) {
-                    logger.trace("{} Received: {}", logPrefix(), buffer.toString(Charset.defaultCharset()).trim());
-                }
-
-                if (debugEnabled) {
-                    logger.debug("{} Queue contains: {} commands", logPrefix(), queue.size());
-                }
+            if (traceEnabled) {
+                logger.trace("{} Received: {}", logPrefix(), buffer.toString(Charset.defaultCharset()).trim());
             }
+
+            buffer.writeBytes(input);
 
             decode(ctx, buffer);
         } finally {
@@ -283,7 +308,6 @@ public class CommandHandler<K, V> extends ChannelDuplexHandler implements RedisC
     }
 
     protected <C extends RedisCommand<K, V, T>, T> void writeToChannel(C command, Channel channel) {
-
 
         if (reliability == Reliability.AT_MOST_ONCE) {
             // cancel on exceptions and remove from queue, because there is no housekeeping
@@ -684,6 +708,12 @@ public class CommandHandler<K, V> extends ChannelDuplexHandler implements RedisC
             logger.debug("{} channelInactive()", logPrefix());
         }
 
+        if (channel != null && ctx.channel() != channel) {
+            logger.debug("{} My channel and ctx.channel mismatch. Propagating event to other listeners.", logPrefix());
+            super.channelInactive(ctx);
+            return;
+        }
+
         synchronized (stateLock) {
             try {
                 lockWritersExclusive();
@@ -844,6 +874,10 @@ public class CommandHandler<K, V> extends ChannelDuplexHandler implements RedisC
         } else if (connectionWatchdog != null) {
             connectionWatchdog.prepareClose(new ConnectionEvents.PrepareClose());
         }
+
+        if (buffer.refCnt() > 0) {
+            buffer.release();
+        }
     }
 
     public boolean isClosed() {
@@ -863,8 +897,11 @@ public class CommandHandler<K, V> extends ChannelDuplexHandler implements RedisC
 
         cancelCommands("Reset");
 
-        if (buffer != null) {
+        if (rsm != null) {
             rsm.reset();
+        }
+
+        if (buffer.refCnt() > 0) {
             buffer.clear();
         }
     }
@@ -903,16 +940,9 @@ public class CommandHandler<K, V> extends ChannelDuplexHandler implements RedisC
             return logPrefix;
         }
         StringBuffer buffer = new StringBuffer(64);
-        buffer.append('[').append(ChannelLogDescriptor.logDescriptor(channel)).append(']');
+        buffer.append('[').append("chid=0x").append(Long.toHexString(commandHandlerId)).append(", ")
+                .append(ChannelLogDescriptor.logDescriptor(channel)).append(']');
         return logPrefix = buffer.toString();
-    }
-
-    private void releaseBuffer() {
-
-        if (buffer != null) {
-            buffer.release();
-            buffer = null;
-        }
     }
 
     private void releaseStateMachine() {
