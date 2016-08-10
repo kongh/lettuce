@@ -123,7 +123,7 @@ public class RedisClusterStressScenariosTest extends AbstractTest {
         RedisChannelHandler<String, String> statefulConnection = (RedisChannelHandler) connection.getStatefulConnection();
 
         connection.set("a", "b");
-        ClusterDistributionChannelWriter<String, String> writer = (ClusterDistributionChannelWriter) statefulConnection
+        ClusterDistributionChannelWriter writer = (ClusterDistributionChannelWriter) statefulConnection
                 .getChannelWriter();
 
         StatefulRedisConnectionImpl<Object, Object> statefulSlotConnection = (StatefulRedisConnectionImpl) writer
